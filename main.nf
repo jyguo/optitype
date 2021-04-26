@@ -21,20 +21,24 @@
     > http://www.gnu.org/licenses/lgpl.html
 
   ./nextflow run nmdp-bioinformatics/flow-Optitype \
-    --with-docker nmdpbioinformatics/flow-optitype \
     --outfile hli-optitype.csv \
     --bamdir s3://bucket/s3/data \
-    --datatype dna
+    --datatype rna
 */
 
 params.help = ''
-params.datatype = 'dna'
-
-optiref=file("/usr/local/bin/OptiType/data/hla_reference_dna.fasta")
+params.datatype = 'rna'
+params.optiref = "s3://gcs3-1/common/rADIO/hla_reference_rna.fasta"
 outfile = file("${params.outfile}")
-bamglob = "${params.bamdir}/*.bam"
 datatype = "${params.datatype}"
-bamfiles = Channel.fromPath(bamglob).ifEmpty { error "cannot find any reads matching ${bamglob}" }.map { path -> tuple(sample(path), path) }
+params.ncpu = 15
+
+Channel
+    .fromPath(file(params.inputManifest))
+    .splitCsv(header:true, sep:'\t')
+    .map { row -> tuple(row.sampleID, row.bam, row.bai) }
+    .set { bam_channel }
+
 
 /*  Help section (option --help in input)  */
 if (params.help) {
@@ -66,6 +70,13 @@ log.info "Output file name   (--outfile)   : ${params.outfile}"
 log.info "Project                          : $workflow.projectDir"
 log.info "Git info                         : $workflow.repository - $workflow.revision [$workflow.commitId]"
 log.info "\n"
+log.info " parameters "
+log.info " ======================"
+log.info " input manifest          : ${params.inputManifest}"
+log.info " output directory         : ${params.outputDir}"
+log.info " ======================"
+log.info ""
+
 
 // Extract pair reads to fq files
 process bam2fastq {
@@ -73,13 +84,15 @@ process bam2fastq {
   tag{ subid }
   
   input:
-    set subid, file(bamfile) from bamfiles
+    set val(subid), path(bamfile), path(baifile) from bam_channel
   output:
     set subid, file("${subid}.end1.fq") into fastq1
     set subid, file("${subid}.end2.fq") into fastq2
 
+  publishDir "${params.outputDir}/${subid}"
+
   """
-  samtools sort -n ${bamfile} | samtools bam2fq -1 ${subid}.end1.fq -2 ${subid}.end2.fq -N -O -
+  samtools sort -@ ${params.ncpu} -n ${bamfile} | samtools bam2fq -@ ${params.ncpu} -1 ${subid}.end1.fq -2 ${subid}.end2.fq -N -O -
   """
 }
 
@@ -90,11 +103,14 @@ process razarEnd1 {
   
   input:
     set subid, file(fq) from fastq1
+    path optiref from params.optiref
   output:
     set subid, file("${subid}.raz-end1.fastq") into razarFilteredEnd1
 
+  publishDir "${params.outputDir}/${subid}"
+
   """
-  razers3 --percent-identity 90 --max-hits 1 --distance-range 0 --output ${subid}.raz-end1.sam ${optiref} ${subid}.end1.fq
+  razers3 -tc ${params.ncpu} --percent-identity 90 --max-hits 1 --distance-range 0 --output ${subid}.raz-end1.sam ${optiref} ${subid}.end1.fq
   cat ${subid}.raz-end1.sam | grep -v ^@ | awk '{print "@"\$1"\\n"\$10"\\n+\\n"\$11}' > ${subid}.raz-end1.fastq
   """
 }
@@ -106,11 +122,14 @@ process razarEnd2 {
   
   input:
     set subid, file(fq) from fastq2
+    path optiref from params.optiref
   output:
     set subid, file("${subid}.raz-end2.fastq") into razarFilteredEnd2
 
+  publishDir "${params.outputDir}/${subid}"
+
   """
-  razers3 --percent-identity 90 --max-hits 1 --distance-range 0 --output ${subid}.raz-end2.sam ${optiref} ${subid}.end2.fq
+  razers3 -tc ${params.ncpu} --percent-identity 90 --max-hits 1 --distance-range 0 --output ${subid}.raz-end2.sam ${optiref} ${subid}.end2.fq
   cat ${subid}.raz-end2.sam | grep -v ^@ | awk '{print "@"\$1"\\n"\$10"\\n+\\n"\$11}' > ${subid}.raz-end2.fastq
   """
 }
@@ -127,26 +146,21 @@ process optitype {
   input:
     set subid, file(fq1), file(fq2) from fastqFiltered
   output:
-    stdout optioutput
+    file "typing_results.txt" into optioutput
+
+  publishDir "${params.outputDir}/${subid}"
 
   """
-  OptiTypePipeline.py -i ${fq1} ${fq2} --id ${subid} --${datatype} --outdir na
+  OptiTypePipeline.py -i ${fq1} ${fq2} --id ${subid} --${datatype} --outdir na > typing_results.txt
   """
 }
 
 // Print out results to output file
-optioutput
-.collectFile() {  typing ->
-       [ "typing_results.txt", typing ]
-   }
-.subscribe { file -> copy(file) }
-
-// On completion
-workflow.onComplete {
-    println "Pipeline completed at: $workflow.complete"
-    println "Duration    : ${workflow.duration}"
-    println "Execution status: ${ workflow.success ? 'OK' : 'failed' }"
-}
+// optioutput
+// .collectFile() {  typing ->
+//       [ "typing_results.txt", typing ]
+//   }
+// .subscribe { file -> copy(file) }
 
 def copy (file) { 
   log.info "Copying ${file.name} into: $outfile"
